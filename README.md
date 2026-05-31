@@ -2,7 +2,7 @@
 
 This project is setup with [uv](https://docs.astral.sh/uv/). Please visit the website and install it onto your system. Once installed, you can get all the dependencies by running `uv sync`.
 
-For any other issues, please check the documentation, or ask your favourite LLM.
+To add dependencies, use `uv add`. For any other issues, please check the documentation, or ask your favourite LLM.
 
 ### Access token for Synapse
 
