@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import scipy.ndimage as ndimage
+from scipy.signal import welch
+
+
+# ==========================================
+# SHARED UTILITIES
+# ==========================================
 
 
 def load_data(folder, columns):
@@ -57,11 +63,17 @@ def clean_data(data, columns):
                     del tasks[task]
                     continue
 
-                # Clean 'Time' column - remove 'sec' and convert to float
-                if "Time" in df.columns and df["Time"].dtype == "O":
-                    df["Time"] = (
-                        df["Time"].str.replace(" sec", "", regex=False).astype(float)
-                    )
+                # Clean 'Time' column - remove 'sec' and convert to float safely
+                if "Time" in df.columns:
+                    try:
+                        df["Time"] = (
+                            df["Time"]
+                            .astype(str)
+                            .str.replace(" sec", "", regex=False)
+                            .astype(float)
+                        )
+                    except ValueError:
+                        pass
 
                 # Drop rows with NaN
                 clean_df = df[columns].dropna()
@@ -76,6 +88,11 @@ def clean_data(data, columns):
             # Remove subject if they have no tasks left
             if not tasks:
                 del subjects[subject]
+
+
+# ==========================================
+# HEATMAP FEATURES
+# ==========================================
 
 
 def compute_global_bounds(data, margin=0.05):
@@ -163,7 +180,7 @@ def build_heatmap_dataset(data, grid, sigma):
     for cohort in data.keys():
         label = 0 if cohort == "control" else 1
 
-        for subject in tqdm(data[cohort].keys(), desc=f"{cohort} subjects"):
+        for subject in tqdm(data[cohort].keys(), desc=f"Heatmaps: {cohort} subjects"):
             for task in data[cohort][subject].keys():
                 df = data[cohort][subject][task]
                 heatmap = generate_sample_heatmap(
@@ -180,9 +197,144 @@ def build_heatmap_dataset(data, grid, sigma):
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32), metadata
 
 
+# ==========================================
+# PSD FREQUENCY FEATURES
+# ==========================================
+
+
+def _interpolate_cop(
+    df, time_col="Time", cols=["LCoP_X", "LCoP_Y", "RCoP_X", "RCoP_Y"], fs=100.0
+):
+    """Helper function to resample CoP data uniformly."""
+    if df.empty or time_col not in df.columns:
+        return df
+
+    # Safely force the time column to numeric to prevent string math errors
+    df[time_col] = pd.to_numeric(df[time_col], errors="coerce")
+
+    df = (
+        df.dropna(subset=[time_col])
+        .drop_duplicates(subset=[time_col])
+        .sort_values(time_col)
+    )
+    if df.empty:
+        return df
+    t_min, t_max = df[time_col].min(), df[time_col].max()
+    num_points = int(np.floor((t_max - t_min) * fs)) + 1
+    df_uniform = pd.DataFrame(
+        {time_col: np.linspace(t_min, t_min + (num_points - 1) / fs, num_points)}
+    )
+    # Merge and interpolate
+    existing_cols = [c for c in cols if c in df.columns]
+    df_joined = pd.merge_asof(
+        df_uniform,
+        df[[time_col] + existing_cols],
+        on=time_col,
+        direction="nearest",
+        tolerance=0.5 / fs,
+    )
+    df_joined[existing_cols] = (
+        df_joined[existing_cols]
+        .interpolate(method="linear", limit_direction="both")
+        .bfill()
+        .ffill()
+    )
+    return df_joined
+
+
+def compute_welch_psd(signal, fs=100.0, nfft=1000):
+    """Computes Welch's PSD safely, keeping frequency bins fixed across different signal lengths."""
+    nperseg = min(nfft, len(signal))
+    noverlap = nperseg // 2 if nperseg > 0 else 0
+    f_dummy = np.fft.rfftfreq(nfft, 1 / fs)
+
+    if len(signal) == 0 or np.std(signal) < 1e-6:
+        return f_dummy, np.zeros_like(f_dummy)
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        f, Pxx = welch(
+            signal,
+            fs=fs,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            nfft=nfft,
+            detrend="linear",
+            scaling="density",
+        )
+    return f, Pxx
+
+
+def build_psd_dataset(
+    data, cols=["LCoP_X", "LCoP_Y", "RCoP_X", "RCoP_Y"], fs=100.0, freq_lim=(0.1, 5.0)
+):
+    X = []
+    y = []
+    metadata = []
+
+    # Pre-calculate masks and feature column names to ensure consistency
+    f_dummy = np.fft.rfftfreq(int(10 * fs), 1 / fs)
+    mask = (f_dummy >= freq_lim[0]) & (f_dummy <= freq_lim[1])
+    f_selected = f_dummy[mask]
+
+    print(
+        f"Extracting {len(f_selected)} frequency bins per sensor in the range {freq_lim[0]} to {freq_lim[1]} Hz"
+    )
+
+    feature_names = []
+    for col in cols:
+        for freq in f_selected:
+            feature_names.append(f"{col}_{freq:.2f}Hz")
+
+    print("Generating PSD features...")
+    for cohort in data.keys():
+        label = 0 if cohort == "control" else 1
+
+        for subject in tqdm(data[cohort].keys(), desc=f"PSD: {cohort} subjects"):
+            for task in data[cohort][subject].keys():
+                df = data[cohort][subject][task]
+                df_interp = _interpolate_cop(df, cols=cols, fs=fs)
+
+                sample_features = []
+                is_valid = False
+
+                for col in cols:
+                    if col in df_interp.columns:
+                        signal = df_interp[col].dropna().values
+                        f, Pxx = compute_welch_psd(signal, fs=fs, nfft=int(10 * fs))
+                        Pxx_selected = Pxx[mask]
+                        sample_features.extend(Pxx_selected)
+                        if np.sum(Pxx_selected) > 0:
+                            is_valid = True
+                    else:
+                        # Missing column, pad with zeros
+                        sample_features.extend(np.zeros(len(f_selected)))
+
+                # We skip samples that are completely flat or empty
+                if is_valid:
+                    X.append(sample_features)
+                    y.append(label)
+                    metadata.append((subject, task))
+
+    # Convert to DataFrame
+    df_features = pd.DataFrame(X, columns=feature_names)
+    df_features.insert(0, "Label", y)
+    df_features.insert(0, "Task", [m[1] for m in metadata])
+    df_features.insert(0, "Subject", [m[0] for m in metadata])
+
+    return df_features
+
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
 if __name__ == "__main__":
-    # Load and clean data
     data_folder = "./download_data/"
+
+    # We load the union of columns needed for both Heatmap and PSD extraction
     columns = ["Time"] + [
         f"{foot}{feature}"
         for foot in ("L", "R")
@@ -193,25 +345,41 @@ if __name__ == "__main__":
             "CoP_Y",
         )
     ]
+
     print("Loading dataset...")
     print("This might take a couple of minutes...")
     data = load_data(data_folder, columns)
+
     print("Cleaning data...")
     clean_data(data, columns)
 
-    # Generate heatmaps
-    grid_size = 64  # Size of the heatmap grid
-    sigma = 1.5  # Controls gaussian blur
+    # -----------------------------------------------------
+    # 1. Generate Heatmaps
+    # -----------------------------------------------------
+    print("\n--- Starting Heatmap Generation ---")
+    grid_size = 64
+    sigma = 1.5
     X_heatmaps, y_labels, heatmap_metadata = build_heatmap_dataset(
         data, grid=grid_size, sigma=sigma
     )
-    print(f"Generated dataset:")
+    print(f"Generated heatmap dataset:")
     print(f"X_heatmaps shape: {X_heatmaps.shape} (N, Channels, H, W)")
     print(f"y_labels shape: {y_labels.shape}")
 
-    # Save the dataset
-    output_file = "./heatmap_dataset.npz"
+    heatmap_output_file = "./heatmap_dataset.npz"
     np.savez_compressed(
-        output_file, X=X_heatmaps, y=y_labels, metadata=heatmap_metadata
+        heatmap_output_file, X=X_heatmaps, y=y_labels, metadata=heatmap_metadata
     )
-    print(f"Dataset saved to {output_file}")
+    print(f"Heatmap Dataset saved to {heatmap_output_file}")
+
+    # -----------------------------------------------------
+    # 2. Generate PSD Features
+    # -----------------------------------------------------
+    print("\n--- Starting PSD Feature Generation ---")
+    df_dataset = build_psd_dataset(data)
+
+    print(f"Generated PSD dataset shape: {df_dataset.shape}")
+
+    psd_output_file = "./psd_dataset.csv"
+    df_dataset.to_csv(psd_output_file, index=False)
+    print(f"PSD Dataset saved to {psd_output_file}")
